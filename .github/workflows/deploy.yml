@@ -1,0 +1,28 @@
+# Stands in for the Coolify auto-deploy: every push to prod-sim publishes version.json + health.json to Pages.
+name: Deploy (fake production)
+on:
+  push:
+    branches: [prod-sim]
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Build site
+        run: |
+          mkdir -p _site
+          printf '{"sha":"%s","ref":"%s"}\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" > _site/version.json
+          printf '{"ok":true}\n' > _site/health.json
+          printf '{"note":"never names a sha"}\n' > _site/static.json
+      - uses: actions/upload-pages-artifact@v3
+      - id: deployment
+        uses: actions/deploy-pages@v4

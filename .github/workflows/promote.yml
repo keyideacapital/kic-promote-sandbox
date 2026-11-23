@@ -1,0 +1,29 @@
+# Sandbox caller. Same as keyideacapital/.github templates/promote-caller.yml except the test knobs
+# (production_branch prod-sim; operator and poll timeout from repo variables so refusals can be forced).
+name: Promote
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version X.Y.Z"
+        required: true
+      sha:
+        description: "Optional: QA-signed SHA (default: newest signed)"
+        required: false
+      new_env_set:
+        description: "Tick only after adding the new env names to the production app"
+        type: boolean
+        default: false
+permissions:
+  contents: write
+jobs:
+  promote:
+    uses: keyideacapital/.github/.github/workflows/promote.yml@f7b7a0e53aed699d6e3b9f76d792f5cd5c0d508d
+    with:
+      version: ${{ inputs.version }}
+      sha: ${{ inputs.sha }}
+      new_env_set: ${{ inputs.new_env_set }}
+      operator: ${{ vars.PROMOTE_OPERATOR_TEST || 'keyideacapital' }}
+      production_branch: prod-sim
+      poll_timeout_seconds: ${{ fromJSON(vars.PROMOTE_POLL_TIMEOUT_TEST || '600') }}
+    secrets: inherit
