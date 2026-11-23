@@ -29,6 +29,11 @@ on:
         type: boolean
         required: false
         default: false
+      workflow_changes_reviewed:
+        description: True only after David reviewed the listed .github/ changes in this release
+        type: boolean
+        required: false
+        default: false
       operator:
         description: The only GitHub login allowed to trigger a promotion
         type: string
@@ -44,6 +49,9 @@ on:
         type: number
         required: false
         default: 600
+    secrets:
+      THRED_PROMOTE_TOKEN:
+        required: false
 
 permissions:
   contents: read
@@ -84,6 +92,7 @@ jobs:
           VERSION: ${{ inputs.version }}
           INPUT_SHA: ${{ inputs.sha }}
           NEW_ENV_SET: ${{ inputs.new_env_set }}
+          WORKFLOW_CHANGES_REVIEWED: ${{ inputs.workflow_changes_reviewed }}
           PROD_BRANCH: ${{ inputs.production_branch }}
         run: |
           python3 - <<'PROMOTE_CHECK_PY'
@@ -129,6 +138,17 @@ jobs:
               r = git("rev-parse", "--verify", "--quiet", ref + "^{commit}", check=False)
               return r.stdout.strip() if r.returncode == 0 else None
 
+          def resolve_sha(prefix):
+              """Hex prefix -> the one commit object it names. Never resolves refs: a tag named like a short SHA is ignored."""
+              if not re.fullmatch(r"[0-9a-fA-F]{7,40}", prefix):
+                  return None, "not a 7-40 character hex SHA"
+              r = git("rev-parse", "--disambiguate=" + prefix.lower(), check=False)
+              commits = [o for o in r.stdout.split()
+                         if git("cat-file", "-t", o, check=False).stdout.strip() == "commit"]
+              if len(commits) == 1:
+                  return commits[0], ""
+              return None, ("ambiguous (%d commits)" % len(commits)) if commits else "no such commit"
+
           def is_ancestor(a, b):
               return git("merge-base", "--is-ancestor", a, b, check=False).returncode == 0
 
@@ -172,6 +192,7 @@ jobs:
           version = os.environ.get("VERSION", "").strip()
           input_sha = os.environ.get("INPUT_SHA", "").strip()
           new_env_set = os.environ.get("NEW_ENV_SET", "false").strip().lower() == "true"
+          workflow_changes_reviewed = os.environ.get("WORKFLOW_CHANGES_REVIEWED", "false").strip().lower() == "true"
           prod_branch = os.environ.get("PROD_BRANCH", "main").strip()
 
           # 1. Version
@@ -197,9 +218,9 @@ jobs:
           rows = []      # (full_sha, verdict, raw) in ledger order
           final = {}     # full_sha -> latest verdict
           for ledger_sha, verdict, raw in ledger_rows(r.stdout):
-              full = resolve(ledger_sha)
+              full, why = resolve_sha(ledger_sha)
               if not full:
-                  print("ledger row skipped (SHA %s not in repo): %s" % (ledger_sha, raw))
+                  print("ledger row skipped (SHA %s: %s): %s" % (ledger_sha, why, raw))
                   continue
               rows.append((full, verdict.upper(), raw))
               final[full] = verdict.upper()
@@ -207,11 +228,9 @@ jobs:
               refuse("no parseable QA rows in origin/develop:%s (needs a table with ref + verdict columns)" % LEDGER)
 
           if input_sha:
-              if not re.fullmatch(r"[0-9a-fA-F]{7,40}", input_sha):
-                  refuse("sha input must be 7-40 hex characters, got %r" % input_sha)
-              sha = resolve(input_sha)
+              sha, why = resolve_sha(input_sha)
               if not sha:
-                  refuse("sha %s not found in the repository" % input_sha)
+                  refuse("sha input %r: %s" % (input_sha, why))
               if final.get(sha) != "SIGNOFF":
                   if sha in final:
                       refuse("latest QA row for %s is %s, not SIGNOFF" % (sha[:10], final[sha]))
@@ -220,8 +239,11 @@ jobs:
                   refuse("signed SHA %s is not on origin/develop" % sha[:10])
           else:
               sha = None
+              newer_unsigned = []
               for full, verdict, raw in reversed(rows):
                   if verdict != "SIGNOFF" or final[full] != "SIGNOFF":
+                      if final[full] != "SIGNOFF" and full not in newer_unsigned:
+                          newer_unsigned.append(full)
                       continue
                   if not is_ancestor(full, develop):
                       print("signed SHA %s skipped: not on origin/develop" % full[:10])
@@ -230,6 +252,10 @@ jobs:
                   break
               if not sha:
                   refuse("no SHA on origin/develop whose latest QA row is SIGNOFF")
+              if newer_unsigned:
+                  msg = "newer ledger rows are not signed (%s); promoting the newest signed SHA instead" % ", ".join("%s=%s" % (x[:10], final[x]) for x in newer_unsigned)
+                  print("::warning::" + msg)
+                  note("WARNING: " + msg)
           signed_row = [raw for full, _, raw in rows if full == sha][-1]
           note("QA-signed SHA %s: %s" % (sha, signed_row))
 
@@ -242,6 +268,12 @@ jobs:
           if not is_ancestor(prod, sha):
               refuse("not a fast-forward: origin/%s (%s) is not an ancestor of %s" % (prod_branch, prod[:10], sha[:10]))
           note("fast-forward origin/%s %s -> %s: ok" % (prod_branch, prod[:10], sha[:10]))
+
+          # 3b. Workflow files: a promotion must not silently carry new or changed CI (it would run with production rights)
+          changed = [p for p in git("diff", "--name-only", prod, sha, "--", ".github/").stdout.splitlines() if p]
+          if changed and not workflow_changes_reviewed:
+              refuse("this release changes .github/ (%s). Review those files, then run again with workflow_changes_reviewed ticked" % ", ".join(changed))
+          note(".github/ changes: %s%s" % (", ".join(changed) or "none", " (reviewed by operator)" if changed else ""))
 
           # 4. Env names (names only; values are never read anywhere)
           new_names = env_names(sha)
@@ -274,8 +306,24 @@ jobs:
     outputs:
       served: ${{ steps.verify.outputs.served }}
       release_url: ${{ steps.release.outputs.url }}
-      reason: ${{ steps.push.outputs.reason || steps.verify.outputs.reason }}
+      reason: ${{ steps.gate.outputs.reason || steps.push.outputs.reason || steps.verify.outputs.reason }}
+      pushed: ${{ steps.push.outputs.pushed }}
+      release_outcome: ${{ steps.release.outcome }}
     steps:
+      - name: Actor and ref (again; a re-run of this job skips the check job)
+        id: gate
+        env:
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          OPERATOR: ${{ inputs.operator }}
+          REF: ${{ github.ref }}
+          PROD_BRANCH: ${{ inputs.production_branch }}
+        run: |
+          refuse() { echo "reason=$1" >> "$GITHUB_OUTPUT"; echo "::error::REFUSED: $1"; exit 1; }
+          [ -n "$OPERATOR" ] || refuse "no operator configured"
+          [ "$TRIGGERING_ACTOR" = "$OPERATOR" ] || refuse "push job triggered by '$TRIGGERING_ACTOR'; only '$OPERATOR' may promote"
+          [ "$REF" = "refs/heads/$PROD_BRANCH" ] || refuse "run from '$REF'"
+          echo "actor $TRIGGERING_ACTOR, ref $REF: ok"
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
@@ -288,6 +336,7 @@ jobs:
           PUSH_TOKEN: ${{ secrets.PROMOTE_TOKEN }}
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ needs.check.outputs.sha }}
+          PROD_BEFORE: ${{ needs.check.outputs.prod_before }}
           VERSION: ${{ inputs.version }}
           PROD_BRANCH: ${{ inputs.production_branch }}
           ACTOR: ${{ github.triggering_actor }}
@@ -309,6 +358,8 @@ jobs:
           else
             fail "no push credential: set PROMOTE_DEPLOY_KEY (or PROMOTE_TOKEN) in the production environment"
           fi
+          NOW=$(git ls-remote "$REMOTE" "refs/heads/$PROD_BRANCH" | cut -f1)
+          [ "$NOW" = "$PROD_BEFORE" ] || fail "origin/$PROD_BRANCH moved since the check ($PROD_BEFORE -> ${NOW:-missing}); run again"
           git config user.name "KIC Promote"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           MSG="release v$VERSION: QA-signed $SHA, promoted by $ACTOR, $RUN_URL"
@@ -317,10 +368,12 @@ jobs:
           if ! git push --atomic "$REMOTE" "$SHA:refs/heads/$PROD_BRANCH" "refs/tags/freeze-$VERSION" "refs/tags/v$VERSION"; then
             fail "push rejected (non-fast-forward, existing tag, or ruleset); nothing was changed"
           fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
           echo "pushed $PROD_BRANCH -> $SHA, tags freeze-$VERSION v$VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: GitHub Release
         id: release
+        continue-on-error: true  # notes are nice to have; never skip the served-SHA check because of them
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -415,6 +468,8 @@ jobs:
           PROMOTE_REASON: ${{ needs.promote.outputs.reason }}
           SHA: ${{ needs.check.outputs.sha }}
           SERVED: ${{ needs.promote.outputs.served }}
+          PUSHED: ${{ needs.promote.outputs.pushed }}
+          RELEASE_OUTCOME: ${{ needs.promote.outputs.release_outcome }}
           RELEASE_URL: ${{ needs.promote.outputs.release_url }}
           VERSION: ${{ inputs.version }}
           ACTOR: ${{ github.triggering_actor }}
@@ -425,9 +480,10 @@ jobs:
           if [ "$CHECK" != "success" ]; then
             TEXT="Promote $REPO v$VERSION: REFUSED (check ${CHECK}): ${CHECK_REASON:-see run}. Nothing pushed. Run: $RUN_URL"
           elif [ "$PROMOTE" = "success" ]; then
-            TEXT="Promote $REPO v$VERSION: PASS. Production serves ${SERVED:0:10}. Release: $RELEASE_URL Run: $RUN_URL"
+            TEXT="Promote $REPO v$VERSION: PASS. Production serves ${SERVED:0:10}. Release: ${RELEASE_URL:-NOT CREATED (release step $RELEASE_OUTCOME)} Run: $RUN_URL"
           else
-            TEXT="Promote $REPO v$VERSION: FAILED at promote (${PROMOTE}): ${PROMOTE_REASON:-see run}. SHA ${SHA:0:10}. Run: $RUN_URL"
+            if [ "$PUSHED" = "true" ]; then P="Branch and tags WERE pushed"; else P="Nothing pushed"; fi
+            TEXT="Promote $REPO v$VERSION: FAILED at promote (${PROMOTE}): ${PROMOTE_REASON:-see run}. $P. SHA ${SHA:0:10}. Run: $RUN_URL"
           fi
           echo "$TEXT" | tee -a "$GITHUB_STEP_SUMMARY"
           if [ -z "$THRED_URL" ] || [ -z "$THRED_TOKEN" ]; then
