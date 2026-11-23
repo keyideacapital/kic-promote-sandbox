@@ -31,5 +31,4 @@ jobs:
       operator: ${{ vars.PROMOTE_OPERATOR_TEST || 'keyideacapital' }}
       production_branch: prod-sim
       poll_timeout_seconds: ${{ fromJSON(vars.PROMOTE_POLL_TIMEOUT_TEST || '600') }}
-    secrets:
-      THRED_PROMOTE_TOKEN: ${{ secrets.THRED_PROMOTE_TOKEN }}
+    secrets: inherit

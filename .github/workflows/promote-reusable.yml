@@ -49,9 +49,8 @@ on:
         type: number
         required: false
         default: 600
-    secrets:
-      THRED_PROMOTE_TOKEN:
-        required: false
+    # No `secrets:` block on purpose. Callers use `secrets: inherit`; tested 2026-11-24: declaring secrets here and
+    # passing only THRED_PROMOTE_TOKEN left the production environment's PROMOTE_DEPLOY_KEY empty in the push job.
 
 permissions:
   contents: read
