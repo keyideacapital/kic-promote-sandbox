@@ -18,7 +18,7 @@ permissions:
   contents: write
 jobs:
   promote:
-    uses: keyideacapital/.github/.github/workflows/promote.yml@f7b7a0e53aed699d6e3b9f76d792f5cd5c0d508d
+    uses: ./.github/workflows/promote-reusable.yml  # byte-identical copy of keyideacapital/.github promote.yml (public repo cannot call the private one)
     with:
       version: ${{ inputs.version }}
       sha: ${{ inputs.sha }}

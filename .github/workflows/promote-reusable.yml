@@ -1,0 +1,441 @@
+# Promote: fast-forward the production branch to the newest QA-signed develop SHA (ADR-106).
+#
+# Called by a ~15-line `.github/workflows/promote.yml` in each project (templates/promote-caller.yml),
+# pinned by full commit SHA. David starts it from GitHub Mobile; nothing else should.
+#
+# Jobs:
+#   check   - no credentials. Actor, ref, version, QA signoff, fast-forward, env names. Any refusal stops here.
+#   promote - environment `production` (branch policy: main only). Tags freeze-X + vX, atomic push, Release,
+#             then waits until the public /version serves the SHA.
+#   report  - always. Posts the outcome to Thred (skips with a warning when no token is configured).
+#
+# Never: force-push, read secret values beyond the push credential, call Coolify, hardcode hosts.
+name: Promote (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Release version X.Y.Z
+        type: string
+        required: true
+      sha:
+        description: Optional QA-signed SHA (default newest signed develop SHA)
+        type: string
+        required: false
+        default: ""
+      new_env_set:
+        description: True only after new env names were added to the production app
+        type: boolean
+        required: false
+        default: false
+      operator:
+        description: The only GitHub login allowed to trigger a promotion
+        type: string
+        required: false
+        default: keyideacapital
+      production_branch:
+        description: Branch that production deploys from
+        type: string
+        required: false
+        default: main
+      poll_timeout_seconds:
+        description: How long to wait for /version to serve the SHA
+        type: number
+        required: false
+        default: 600
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check (no credentials)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+      prev_tag: ${{ steps.pick.outputs.prev_tag }}
+      prod_before: ${{ steps.pick.outputs.prod_before }}
+      reason: ${{ steps.gate.outputs.reason || steps.pick.outputs.reason }}
+    steps:
+      - name: Actor and ref
+        id: gate
+        env:
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          OPERATOR: ${{ inputs.operator }}
+          REF: ${{ github.ref }}
+          PROD_BRANCH: ${{ inputs.production_branch }}
+        run: |
+          refuse() { echo "reason=$1" >> "$GITHUB_OUTPUT"; echo "::error::REFUSED: $1"; exit 1; }
+          [ -n "$OPERATOR" ] || refuse "no operator configured"
+          [ "$TRIGGERING_ACTOR" = "$OPERATOR" ] || refuse "triggered by '$TRIGGERING_ACTOR'; only '$OPERATOR' may promote"
+          [ "$REF" = "refs/heads/$PROD_BRANCH" ] || refuse "run from '$REF'; choose 'Use workflow from: $PROD_BRANCH' and run again"
+          echo "actor $TRIGGERING_ACTOR, ref $REF: ok"
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Version, QA signoff, fast-forward, env names
+        id: pick
+        env:
+          VERSION: ${{ inputs.version }}
+          INPUT_SHA: ${{ inputs.sha }}
+          NEW_ENV_SET: ${{ inputs.new_env_set }}
+          PROD_BRANCH: ${{ inputs.production_branch }}
+        run: |
+          python3 - <<'PROMOTE_CHECK_PY'
+          """Promote pre-push checks. Pure git reads; writes GITHUB_OUTPUT / GITHUB_STEP_SUMMARY only.
+
+          Ledger parsing is a copy of kic-skills scripts/kic/lib/release.py `_qa_ledger_rows`
+          (table with a header naming ref|sha|commit|codesha and verdict|status|result).
+          Per SHA the latest row wins, as in release.py `check_signoff`.
+          """
+          import os, re, subprocess, sys
+
+          NUM = r"(?:0|[1-9][0-9]*)"
+          VERSION_RE = re.compile(r"%s\.%s\.%s" % (NUM, NUM, NUM), re.ASCII)
+          TAG_RE = re.compile(r"v(%s)\.(%s)\.(%s)" % (NUM, NUM, NUM), re.ASCII)
+          ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$", re.ASCII)
+          ENV_FILE = "release/required-env.txt"
+          LEDGER = "qa/LEDGER.md"
+          out_path = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+
+          def out(key, value):
+              with open(out_path, "a") as f:
+                  f.write("%s=%s\n" % (key, value))
+
+          def note(line):
+              print(line)
+              with open(summary_path, "a") as f:
+                  f.write(line + "\n")
+
+          def refuse(reason):
+              out("reason", reason.replace("\n", " "))
+              note("REFUSED: " + reason)
+              print("::error::REFUSED: " + reason.replace("\n", " "))
+              sys.exit(1)
+
+          def git(*args, check=True):
+              r = subprocess.run(["git"] + list(args), capture_output=True, text=True)
+              if check and r.returncode != 0:
+                  refuse("git %s failed: %s" % (" ".join(args), r.stderr.strip()))
+              return r
+
+          def resolve(ref):
+              r = git("rev-parse", "--verify", "--quiet", ref + "^{commit}", check=False)
+              return r.stdout.strip() if r.returncode == 0 else None
+
+          def is_ancestor(a, b):
+              return git("merge-base", "--is-ancestor", a, b, check=False).returncode == 0
+
+          def ledger_rows(text):
+              ref_idx = verdict_idx = None
+              for line in text.splitlines():
+                  raw = line.strip()
+                  if not (raw.startswith("|") and raw.endswith("|")):
+                      continue
+                  cells = [c.strip() for c in raw[1:-1].split("|")]
+                  if all(re.fullmatch(r":?-{3,}:?", c) for c in cells):
+                      continue
+                  if ref_idx is None or verdict_idx is None:
+                      headers = [re.sub(r"[^a-z]", "", c.lower()) for c in cells]
+                      ref_idx = next((i for i, n in enumerate(headers) if n in ("ref", "sha", "commit", "codesha")), None)
+                      verdict_idx = next((i for i, n in enumerate(headers) if n in ("verdict", "status", "result")), None)
+                      if ref_idx is None or verdict_idx is None:
+                          ref_idx = verdict_idx = None
+                      continue
+                  if ref_idx >= len(cells):
+                      continue
+                  m = re.match(r"^([0-9a-f]{7,40})(?:\b|$)", cells[ref_idx], re.I)
+                  if m:
+                      verdict = cells[verdict_idx].strip() if verdict_idx < len(cells) else ""
+                      yield m.group(1), verdict, raw
+
+          def env_names(ref):
+              r = git("show", "%s:%s" % (ref, ENV_FILE), check=False)
+              if r.returncode != 0:
+                  return None
+              names = set()
+              for line in r.stdout.splitlines():
+                  line = line.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  if not ENV_NAME_RE.fullmatch(line):
+                      refuse("%s at %s has an invalid name line: %r" % (ENV_FILE, ref[:10], line))
+                  names.add(line)
+              return names
+
+          version = os.environ.get("VERSION", "").strip()
+          input_sha = os.environ.get("INPUT_SHA", "").strip()
+          new_env_set = os.environ.get("NEW_ENV_SET", "false").strip().lower() == "true"
+          prod_branch = os.environ.get("PROD_BRANCH", "main").strip()
+
+          # 1. Version
+          if not VERSION_RE.fullmatch(version):
+              refuse("version must be X.Y.Z, got %r" % version)
+          for tag in ("v" + version, "freeze-" + version):
+              if resolve("refs/tags/" + tag):
+                  refuse("tag %s already exists" % tag)
+          tags = [t for t in git("tag", "--list", "v*").stdout.split() if TAG_RE.fullmatch(t)]
+          tags.sort(key=lambda t: tuple(int(x) for x in TAG_RE.fullmatch(t).groups()))
+          prev_tag = tags[-1] if tags else ""
+          if prev_tag and tuple(int(x) for x in version.split(".")) <= tuple(int(x) for x in TAG_RE.fullmatch(prev_tag).groups()):
+              refuse("version %s is not greater than the latest release %s" % (version, prev_tag))
+          note("version %s (previous release: %s)" % (version, prev_tag or "none"))
+
+          # 2. QA signoff from origin/develop:qa/LEDGER.md
+          develop = resolve("refs/remotes/origin/develop")
+          if not develop:
+              refuse("origin/develop not found")
+          r = git("show", "refs/remotes/origin/develop:" + LEDGER, check=False)
+          if r.returncode != 0:
+              refuse("%s missing from origin/develop" % LEDGER)
+          rows = []      # (full_sha, verdict, raw) in ledger order
+          final = {}     # full_sha -> latest verdict
+          for ledger_sha, verdict, raw in ledger_rows(r.stdout):
+              full = resolve(ledger_sha)
+              if not full:
+                  print("ledger row skipped (SHA %s not in repo): %s" % (ledger_sha, raw))
+                  continue
+              rows.append((full, verdict.upper(), raw))
+              final[full] = verdict.upper()
+          if not rows:
+              refuse("no parseable QA rows in origin/develop:%s (needs a table with ref + verdict columns)" % LEDGER)
+
+          if input_sha:
+              if not re.fullmatch(r"[0-9a-fA-F]{7,40}", input_sha):
+                  refuse("sha input must be 7-40 hex characters, got %r" % input_sha)
+              sha = resolve(input_sha)
+              if not sha:
+                  refuse("sha %s not found in the repository" % input_sha)
+              if final.get(sha) != "SIGNOFF":
+                  if sha in final:
+                      refuse("latest QA row for %s is %s, not SIGNOFF" % (sha[:10], final[sha]))
+                  refuse("no QA SIGNOFF row for %s in %s" % (sha[:10], LEDGER))
+              if not is_ancestor(sha, develop):
+                  refuse("signed SHA %s is not on origin/develop" % sha[:10])
+          else:
+              sha = None
+              for full, verdict, raw in reversed(rows):
+                  if verdict != "SIGNOFF" or final[full] != "SIGNOFF":
+                      continue
+                  if not is_ancestor(full, develop):
+                      print("signed SHA %s skipped: not on origin/develop" % full[:10])
+                      continue
+                  sha = full
+                  break
+              if not sha:
+                  refuse("no SHA on origin/develop whose latest QA row is SIGNOFF")
+          signed_row = [raw for full, _, raw in rows if full == sha][-1]
+          note("QA-signed SHA %s: %s" % (sha, signed_row))
+
+          # 3. Fast-forward only
+          prod = resolve("refs/remotes/origin/" + prod_branch)
+          if not prod:
+              refuse("origin/%s not found" % prod_branch)
+          if prod == sha:
+              refuse("origin/%s is already at %s: nothing to release" % (prod_branch, sha[:10]))
+          if not is_ancestor(prod, sha):
+              refuse("not a fast-forward: origin/%s (%s) is not an ancestor of %s" % (prod_branch, prod[:10], sha[:10]))
+          note("fast-forward origin/%s %s -> %s: ok" % (prod_branch, prod[:10], sha[:10]))
+
+          # 4. Env names (names only; values are never read anywhere)
+          new_names = env_names(sha)
+          if new_names is None:
+              print("::warning::%s not found at %s; env-name check skipped" % (ENV_FILE, sha[:10]))
+              note("env names: skipped (no %s)" % ENV_FILE)
+          else:
+              old_names = env_names(prod) or set()
+              added = sorted(new_names - old_names)
+              if added and not new_env_set:
+                  refuse("new env names since origin/%s: %s. Add them to the production app, then run again with new_env_set ticked" % (prod_branch, ", ".join(added)))
+              note("env names: %d required, added since %s: %s%s" % (len(new_names), prod_branch, ", ".join(added) or "none", " (confirmed by operator)" if added else ""))
+
+          out("sha", sha)
+          out("prev_tag", prev_tag)
+          out("prod_before", prod)
+          PROMOTE_CHECK_PY
+
+  promote:
+    name: Tag, push, verify
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    concurrency:
+      group: promote-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      served: ${{ steps.verify.outputs.served }}
+      release_url: ${{ steps.release.outputs.url }}
+      reason: ${{ steps.push.outputs.reason || steps.verify.outputs.reason }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Tag and push (atomic, fast-forward only)
+        id: push
+        env:
+          DEPLOY_KEY: ${{ secrets.PROMOTE_DEPLOY_KEY }}
+          PUSH_TOKEN: ${{ secrets.PROMOTE_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.check.outputs.sha }}
+          VERSION: ${{ inputs.version }}
+          PROD_BRANCH: ${{ inputs.production_branch }}
+          ACTOR: ${{ github.triggering_actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          fail() { echo "reason=$1" >> "$GITHUB_OUTPUT"; echo "::error::$1"; exit 1; }
+          if [ -n "$DEPLOY_KEY" ]; then
+            install -d -m 700 ~/.ssh
+            printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/promote_key && chmod 600 ~/.ssh/promote_key
+            gh api meta --jq '.ssh_keys[] | "github.com " + .' > ~/.ssh/promote_known_hosts
+            export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/promote_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/promote_known_hosts"
+            REMOTE="git@github.com:${GITHUB_REPOSITORY}.git"
+            echo "push credential: deploy key"
+          elif [ -n "$PUSH_TOKEN" ]; then
+            git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$PUSH_TOKEN" | base64 -w0)"
+            REMOTE="https://github.com/${GITHUB_REPOSITORY}.git"
+            echo "push credential: token"
+          else
+            fail "no push credential: set PROMOTE_DEPLOY_KEY (or PROMOTE_TOKEN) in the production environment"
+          fi
+          git config user.name "KIC Promote"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          MSG="release v$VERSION: QA-signed $SHA, promoted by $ACTOR, $RUN_URL"
+          git tag -a "freeze-$VERSION" "$SHA" -m "freeze $VERSION: QA-signed $SHA ($RUN_URL)"
+          git tag -a "v$VERSION" "$SHA" -m "$MSG"
+          if ! git push --atomic "$REMOTE" "$SHA:refs/heads/$PROD_BRANCH" "refs/tags/freeze-$VERSION" "refs/tags/v$VERSION"; then
+            fail "push rejected (non-fast-forward, existing tag, or ruleset); nothing was changed"
+          fi
+          echo "pushed $PROD_BRANCH -> $SHA, tags freeze-$VERSION v$VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          PREV: ${{ needs.check.outputs.prev_tag }}
+        run: |
+          set -euo pipefail
+          RANGE="v$VERSION"; [ -n "$PREV" ] && RANGE="$PREV..v$VERSION"
+          { echo "Changes ${PREV:-since the start}..v$VERSION:"; echo; git log --no-merges --format='- %s (%h)' "$RANGE"; } > notes.md
+          URL=$(gh release create "v$VERSION" --verify-tag --title "v$VERSION" --notes-file notes.md)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "release: $URL" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for production to serve the SHA
+        id: verify
+        env:
+          VERSION_URL: ${{ vars.PROD_VERSION_URL }}
+          HEALTH_URL: ${{ vars.PROD_HEALTH_URL }}
+          SHA: ${{ needs.check.outputs.sha }}
+          TIMEOUT: ${{ inputs.poll_timeout_seconds }}
+        run: |
+          python3 - <<'PROMOTE_VERIFY_PY'
+          import json, os, re, sys, time, urllib.request
+
+          sha = os.environ["SHA"].lower()
+          version_url = os.environ.get("VERSION_URL", "").strip()
+          health_url = os.environ.get("HEALTH_URL", "").strip()
+          timeout = int(float(os.environ.get("TIMEOUT") or 600))
+          out_path = os.environ["GITHUB_OUTPUT"]
+
+          def out(key, value):
+              with open(out_path, "a") as f:
+                  f.write("%s=%s\n" % (key, value))
+
+          def fail(reason):
+              out("reason", reason)
+              print("::error::" + reason)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write("VERIFY FAILED: %s\n" % reason)
+              sys.exit(1)
+
+          def get(url):
+              sep = "&" if "?" in url else "?"
+              req = urllib.request.Request(url + sep + "promote_nocache=%d" % time.time(),
+                                           headers={"Cache-Control": "no-cache", "User-Agent": "kic-promote"})
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      return resp.status, resp.read(65536).decode("utf-8", "replace")
+              except urllib.error.HTTPError as e:
+                  return e.code, ""
+              except Exception as e:  # network errors: keep polling
+                  return None, type(e).__name__
+
+          def names_sha(body):
+              # A hex token of 7+ chars that is a prefix of the SHA (JSON sha/commit fields or plain text).
+              return any(sha.startswith(tok.lower()) for tok in re.findall(r"(?<![0-9a-fA-F])[0-9a-fA-F]{7,40}(?![0-9a-fA-F])", body))
+
+          if not version_url or not health_url:
+              fail("PROD_VERSION_URL and PROD_HEALTH_URL repo variables must be set")
+          deadline = time.time() + timeout
+          last = ""
+          while True:
+              vs, body = get(version_url)
+              hs, _ = get(health_url)
+              ok_v = vs == 200 and names_sha(body)
+              last = "version HTTP %s (%s), health HTTP %s" % (vs, "serves %s" % sha[:7] if ok_v else "not %s yet" % sha[:7], hs)
+              print(time.strftime("%H:%M:%S"), last)
+              if ok_v and hs == 200:
+                  out("served", sha)
+                  with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                      f.write("production serves %s; health 200\n" % sha)
+                  break
+              if time.time() >= deadline:
+                  fail("timed out after %ds: %s. Tags and branch were pushed; the deploy did not show up" % (timeout, last))
+              time.sleep(15)
+          PROMOTE_VERIFY_PY
+
+  report:
+    name: Report to Thred
+    needs: [check, promote]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Post outcome
+        env:
+          THRED_URL: ${{ vars.THRED_URL }}
+          THRED_TOKEN: ${{ secrets.THRED_PROMOTE_TOKEN }}
+          CHECK: ${{ needs.check.result }}
+          PROMOTE: ${{ needs.promote.result }}
+          CHECK_REASON: ${{ needs.check.outputs.reason }}
+          PROMOTE_REASON: ${{ needs.promote.outputs.reason }}
+          SHA: ${{ needs.check.outputs.sha }}
+          SERVED: ${{ needs.promote.outputs.served }}
+          RELEASE_URL: ${{ needs.promote.outputs.release_url }}
+          VERSION: ${{ inputs.version }}
+          ACTOR: ${{ github.triggering_actor }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$CHECK" != "success" ]; then
+            TEXT="Promote $REPO v$VERSION: REFUSED (check ${CHECK}): ${CHECK_REASON:-see run}. Nothing pushed. Run: $RUN_URL"
+          elif [ "$PROMOTE" = "success" ]; then
+            TEXT="Promote $REPO v$VERSION: PASS. Production serves ${SERVED:0:10}. Release: $RELEASE_URL Run: $RUN_URL"
+          else
+            TEXT="Promote $REPO v$VERSION: FAILED at promote (${PROMOTE}): ${PROMOTE_REASON:-see run}. SHA ${SHA:0:10}. Run: $RUN_URL"
+          fi
+          echo "$TEXT" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -z "$THRED_URL" ] || [ -z "$THRED_TOKEN" ]; then
+            echo "::warning::THRED_URL or THRED_PROMOTE_TOKEN not set; report not posted"
+            exit 0
+          fi
+          jq -n --arg content "$TEXT (triggered by $ACTOR)" '{content: $content}' > payload.json
+          code=$(curl -sS -o resp.json -w '%{http_code}' -X POST "${THRED_URL%/}/api/agent/messages" \
+            -H "Authorization: Bearer $THRED_TOKEN" -H "Content-Type: application/json" --data @payload.json)
+          echo "Thred HTTP $code"
+          [ "$code" = "200" ] || { echo "::error::Thred post failed: HTTP $code"; exit 1; }
